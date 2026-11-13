@@ -1,0 +1,575 @@
+import * as THREE from 'three';
+import { BodyModel } from './model';
+import type { CaudalSpec, FinShape, MedianFin, PairedFin, Species } from './types';
+import { clamp, curve, DEG, lerp, rng, smooth } from './math';
+import { ensureAttrs, makeUniforms, patchMaterial, type FishUniforms } from './shader';
+import { paintBump, paintSkin } from './skin';
+
+// ── geometry helpers ─────────────────────────────────────────────────────────
+interface V { p: THREE.Vector3; jaw?: number; flap?: number; side?: number }
+
+function grid(nu: number, nv: number, fn: (u: number, v: number) => V, flipWinding = false) {
+  const pos: number[] = [], uv: number[] = [], jaw: number[] = [], flap: number[] = [], side: number[] = [], idx: number[] = [];
+  for (let j = 0; j <= nv; j++)
+    for (let i = 0; i <= nu; i++) {
+      const u = i / nu, v = j / nv;
+      const r = fn(u, v);
+      pos.push(r.p.x, r.p.y, r.p.z);
+      uv.push(u, v);
+      jaw.push(r.jaw ?? 0); flap.push(r.flap ?? 0); side.push(r.side ?? 0);
+    }
+  for (let j = 0; j < nv; j++)
+    for (let i = 0; i < nu; i++) {
+      const a = j * (nu + 1) + i, b = a + 1, c = a + nu + 1, d = c + 1;
+      if (flipWinding) idx.push(a, c, b, b, c, d);
+      else idx.push(a, b, c, b, d, c);
+    }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  g.setAttribute('uv', new THREE.Float32BufferAttribute(uv, 2));
+  g.setAttribute('aJaw', new THREE.Float32BufferAttribute(jaw, 1));
+  g.setAttribute('aFlap', new THREE.Float32BufferAttribute(flap, 1));
+  g.setAttribute('aSide', new THREE.Float32BufferAttribute(side, 1));
+  g.setIndex(idx);
+  g.computeVertexNormals();
+  return g;
+}
+
+/** accumulates many small baked primitives into one geometry */
+class Batch {
+  pos: number[] = []; nor: number[] = []; uv: number[] = []; jaw: number[] = []; flap: number[] = []; side: number[] = []; idx: number[] = [];
+  add(src: THREE.BufferGeometry, m: THREE.Matrix4, jaw = 0, flapFn?: (p: THREE.Vector3, i: number) => number, side = 0) {
+    const g = src.index ? src : src;
+    const P = g.getAttribute('position'), N = g.getAttribute('normal'), U = g.getAttribute('uv');
+    const nm = new THREE.Matrix3().getNormalMatrix(m);
+    const base = this.pos.length / 3;
+    const v = new THREE.Vector3(), n = new THREE.Vector3();
+    for (let i = 0; i < P.count; i++) {
+      v.fromBufferAttribute(P, i);
+      const local = v.clone();
+      v.applyMatrix4(m);
+      n.fromBufferAttribute(N, i).applyMatrix3(nm).normalize();
+      this.pos.push(v.x, v.y, v.z); this.nor.push(n.x, n.y, n.z);
+      this.uv.push(U ? U.getX(i) : 0, U ? U.getY(i) : 0);
+      this.jaw.push(jaw); this.flap.push(flapFn ? flapFn(local, i) : 0); this.side.push(side);
+    }
+    if (g.index) for (let i = 0; i < g.index.count; i++) this.idx.push(base + g.index.getX(i));
+    else for (let i = 0; i < P.count; i++) this.idx.push(base + i);
+  }
+  build() {
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.Float32BufferAttribute(this.pos, 3));
+    g.setAttribute('normal', new THREE.Float32BufferAttribute(this.nor, 3));
+    g.setAttribute('uv', new THREE.Float32BufferAttribute(this.uv, 2));
+    g.setAttribute('aJaw', new THREE.Float32BufferAttribute(this.jaw, 1));
+    g.setAttribute('aFlap', new THREE.Float32BufferAttribute(this.flap, 1));
+    g.setAttribute('aSide', new THREE.Float32BufferAttribute(this.side, 1));
+    g.setIndex(this.idx);
+    return g;
+  }
+  get empty() { return this.pos.length === 0; }
+}
+
+const orient = (pos: THREE.Vector3, dir: THREE.Vector3, sx = 1, sy = 1, sz = 1) => {
+  const q = new THREE.Quaternion().setFromUnitVectors(new THREE.Vector3(0, 1, 0), dir.clone().normalize());
+  return new THREE.Matrix4().compose(pos, q, new THREE.Vector3(sx, sy, sz));
+};
+
+// ── fin outline library (normalised height along the base) ──────────────────
+const SHAPES: Record<FinShape, [number, number][]> = {
+  tri: [[0, 0.8], [0.18, 1], [0.55, 0.55], [1, 0.12]],
+  falcate: [[0, 1], [0.15, 0.78], [0.5, 0.3], [1, 0.14]],
+  round: [[0, 0.35], [0.25, 0.85], [0.6, 1], [0.9, 0.75], [1, 0.4]],
+  even: [[0, 0.35], [0.06, 0.9], [0.5, 1], [0.94, 0.9], [1, 0.4]],
+  spiny: [[0, 0.5], [0.15, 1], [0.45, 0.85], [0.8, 0.55], [1, 0.3]],
+  sail: [[0, 0.7], [0.12, 1], [0.45, 0.95], [0.8, 0.55], [1, 0.12]],
+  adipose: [[0, 0.1], [0.45, 1], [0.85, 0.85], [1, 0.4]],
+  shark: [[0, 1], [0.3, 0.6], [0.7, 0.22], [1, 0.05]],
+  lobe: [[0, 0.45], [0.35, 1], [0.75, 0.85], [1, 0.3]],
+  flag: [[0, 1], [0.12, 0.85], [0.45, 0.4], [1, 0.25]],
+  veil: [[0, 0.55], [0.3, 0.95], [0.7, 1.05], [1, 1]],
+  fan: [[0, 0.55], [0.3, 0.95], [0.65, 1], [1, 0.7]],
+  rect: [[0, 0.75], [0.5, 1], [1, 0.85]],
+  low: [[0, 0.25], [0.1, 1], [0.9, 1], [1, 0.35]],
+  leaf: [[0, 0.15], [0.5, 1], [1, 0.15]],
+};
+const shapeFns: Partial<Record<FinShape, (u: number) => number>> = {};
+const shapeH = (s: FinShape, u: number) => (shapeFns[s] ??= curve(SHAPES[s] ?? SHAPES.tri))(u);
+
+const SWIM: Record<string, { amp: number; wave: number; freq: number; a0: number; pow: number; flap: number; finWave: number }> = {
+  carangiform: { amp: 0.05, wave: 7, freq: 7, a0: 0.1, pow: 2.2, flap: 0.012, finWave: 0.003 },
+  subcarangiform: { amp: 0.06, wave: 6.5, freq: 6, a0: 0.14, pow: 1.8, flap: 0.012, finWave: 0.003 },
+  thunniform: { amp: 0.045, wave: 5.5, freq: 9, a0: 0.04, pow: 3.6, flap: 0.004, finWave: 0.0 },
+  anguilliform: { amp: 0.065, wave: 12, freq: 6, a0: 0.3, pow: 1.1, flap: 0.01, finWave: 0.004 },
+  ostraciiform: { amp: 0.06, wave: 2.5, freq: 8, a0: 0, pow: 7, flap: 0.03, finWave: 0.006 },
+  labriform: { amp: 0.018, wave: 5, freq: 4, a0: 0.1, pow: 2, flap: 0.035, finWave: 0.004 },
+  rajiform: { amp: 0.01, wave: 6, freq: 3, a0: 0, pow: 3, flap: 0.004, finWave: 0 },
+  syngnathiform: { amp: 0.0, wave: 4, freq: 2, a0: 0, pow: 2, flap: 0.02, finWave: 0.015 },
+  still: { amp: 0.012, wave: 5, freq: 3, a0: 0.1, pow: 2, flap: 0.01, finWave: 0.002 },
+};
+
+export interface FishBuild {
+  group: THREE.Group;
+  model: BodyModel;
+  uniforms: FishUniforms;
+  swim: (typeof SWIM)[string];
+  wing: number;
+  radius: number;
+  dispose: () => void;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+export function buildFish(sp: Species, seed = 1): FishBuild {
+  const L = 2;
+  const model = new BodyModel(sp, L);
+  const u = makeUniforms();
+  const group = new THREE.Group();
+  const disposables: { dispose: () => void }[] = [];
+  const R = rng(seed);
+  const col = (c: string) => new THREE.Color(c);
+
+  const addMesh = (g: THREE.BufferGeometry, m: THREE.Material, order = 0) => {
+    ensureAttrs(g);
+    const mesh = new THREE.Mesh(g, m);
+    mesh.renderOrder = order;
+    mesh.frustumCulled = false;
+    mesh.castShadow = true;
+    group.add(mesh);
+    disposables.push(g, m);
+    return mesh;
+  };
+
+  // ── BODY LOFT ──────────────────────────────────────────────────────────────
+  const NS = 220, nU = 26, nL = 22;
+  const ring = 2 * (nU + nL) + 4;
+  const pos = new Float32Array((NS + 1) * ring * 3);
+  const uvs = new Float32Array((NS + 1) * ring * 2);
+  const jaw = new Float32Array((NS + 1) * ring);
+  const sAt: number[] = [];
+  const v3 = new THREE.Vector3();
+  const segs: [number, number, number][] = []; // [count, φ-start fn id, …]
+  void segs;
+  for (let i = 0; i <= NS; i++) {
+    const t = i / NS;
+    const s = Math.pow(t, 1.3) * 1.0;
+    sAt.push(s);
+    const pm = model.seamPhi(s);
+    const seg: [number, number, number, number][] = [
+      // [φ0, φ1, n, lowerJaw(0/1) direction]
+      [0, pm, nU, 0],
+      [pm, Math.PI, nL, 1],
+      [Math.PI, 2 * Math.PI - pm, nL, -1],
+      [2 * Math.PI - pm, 2 * Math.PI, nU, 0],
+    ];
+    let k = i * ring;
+    for (const [a, b, n, lj] of seg) {
+      for (let j = 0; j <= n; j++) {
+        const phi = lerp(a, b, j / n);
+        model.surface(s, phi, v3);
+        if (lj !== 0 && sp.mouth.jut > 0 && model.hasJaw()) {
+          // protruding lower jaw (mandible projects beyond the premaxilla)
+          const depth = lj === 1 ? j / n : 1 - j / n;
+          const k2 = (1 - smooth(model.mouthTip.s, model.mouthTip.s + 0.07, s)) * (1 - 0.5 * depth);
+          v3.x += sp.mouth.jut * L * k2;
+        }
+        pos.set([v3.x, v3.y, v3.z], k * 3);
+        uvs.set([s, phi / (2 * Math.PI)], k * 2);
+        if (lj !== 0) {
+          const depth = lj === 1 ? j / n : 1 - j / n;
+          jaw[k] = model.jawWeight(s, depth);
+        }
+        k++;
+      }
+    }
+  }
+  const idx: number[] = [];
+  const segStart = [0, nU + 1, nU + nL + 2, nU + 2 * nL + 3];
+  const segN = [nU, nL, nL, nU];
+  for (let i = 0; i < NS; i++)
+    for (let q = 0; q < 4; q++)
+      for (let j = 0; j < segN[q]; j++) {
+        const a = i * ring + segStart[q] + j, b = a + 1, c = a + ring, d = c + 1;
+        idx.push(a, c, b, b, c, d);
+      }
+  const bodyG = new THREE.BufferGeometry();
+  bodyG.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  bodyG.setAttribute('uv', new THREE.BufferAttribute(uvs, 2));
+  bodyG.setAttribute('aJaw', new THREE.BufferAttribute(jaw, 1));
+  bodyG.setIndex(idx);
+  bodyG.computeVertexNormals();
+  // weld normals across duplicated seams (keep the lip seam crisp in front of the rictus)
+  {
+    const N = bodyG.getAttribute('normal') as THREE.BufferAttribute;
+    const avg = (a: number, b: number) => {
+      const x = N.getX(a) + N.getX(b), y = N.getY(a) + N.getY(b), z = N.getZ(a) + N.getZ(b);
+      const l = Math.hypot(x, y, z) || 1;
+      N.setXYZ(a, x / l, y / l, z / l); N.setXYZ(b, x / l, y / l, z / l);
+    };
+    const rs = model.rictus.s + 0.01;
+    for (let i = 0; i <= NS; i++) {
+      const o = i * ring;
+      const lipOpen = model.hasJaw() && sAt[i] < rs;
+      if (!lipOpen) { avg(o + nU, o + nU + 1); avg(o + nU + 2 * nL + 2, o + nU + 2 * nL + 3); }
+      avg(o + nU + nL + 1, o + nU + nL + 2); // ventral midline
+      avg(o + ring - 1, o); // dorsal midline
+    }
+    N.needsUpdate = true;
+  }
+
+  const skin = paintSkin(model, seed);
+  const bump = paintBump(model, seed);
+  const c = sp.color;
+  const bodyMat = new THREE.MeshPhysicalMaterial({
+    map: skin.tex,
+    bumpMap: bump,
+    bumpScale: sp.skin.bump,
+    roughness: c.rough ?? 0.42,
+    metalness: c.metal ?? 0.08,
+    clearcoat: 0.55,
+    clearcoatRoughness: 0.32,
+    iridescence: c.iri ?? 0,
+    iridescenceIOR: 1.6,
+    sheen: c.sheen ?? 0,
+    sheenColor: new THREE.Color(c.side),
+    transparent: !!c.trans,
+    opacity: c.trans ? 1 - c.trans : 1,
+  });
+  patchMaterial(bodyMat, u);
+  addMesh(bodyG, bodyMat, 1);
+  disposables.push(skin.tex, bump);
+
+  // ── MOUTH CAVITY + TEETH ──────────────────────────────────────────────────
+  const { mouthTip: mt, rictus: rc } = model;
+  const m = sp.mouth;
+  if (model.hasJaw()) {
+    const interiorMat = patchMaterial(new THREE.MeshStandardMaterial({ color: '#7a2f36', roughness: 0.55, side: THREE.DoubleSide }), u);
+    const s0 = mt.s, s1 = rc.s + 0.022;
+    const lip = (s: number, side: 1 | -1) => {
+      const pm = model.seamPhi(s);
+      return model.surface(s, side === 1 ? pm : 2 * Math.PI - pm);
+    };
+    const mid = (s: number) => ({ y: model.mouthY(Math.min(s, rc.s)), top: model.top(s), bot: model.bot(s) });
+    // palate
+    addMesh(grid(10, 24, (uu, vv) => {
+      const s = lerp(s0, s1, vv);
+      const a = lip(s, 1), b = lip(s, -1);
+      const { y, top } = mid(s);
+      const dep = 0.55 * (top - y) * smooth(s0, s0 + 0.03, s);
+      const p = a.clone().lerp(b, uu);
+      p.z *= 0.93;
+      const lift = dep * Math.sin(Math.PI * uu) * L;
+      const f = model.frame(s);
+      p.addScaledVector(f.N, lift);
+      return { p, jaw: 0 };
+    }), interiorMat);
+    // floor of mouth + tongue
+    addMesh(grid(10, 24, (uu, vv) => {
+      const s = lerp(s0, s1, vv);
+      const a = lip(s, 1), b = lip(s, -1);
+      const { y, bot } = mid(s);
+      const dep = 0.5 * (y + bot) * smooth(s0, s0 + 0.03, s);
+      const p = a.clone().lerp(b, uu);
+      p.z *= 0.93;
+      p.addScaledVector(model.frame(s).N, -dep * Math.sin(Math.PI * uu) * L);
+      const w = lerp(model.jawWeight(s, 0), model.jawWeight(s, 0.5), Math.sin(Math.PI * uu));
+      return { p, jaw: w };
+    }), interiorMat);
+    // cheek membranes (posterior part of the cleft) – stretch as the jaw drops
+    for (const side of [1, -1] as const) {
+      const ms = lerp(s0, rc.s, 0.5);
+      addMesh(grid(14, 6, (uu, vv) => {
+        const s = lerp(ms, s1, uu);
+        const p = lip(s, side);
+        p.z *= 1 - 0.04 * Math.sin(Math.PI * vv);
+        return { p, jaw: model.jawWeight(s, 0) * vv };
+      }), interiorMat);
+    }
+    // throat wall
+    addMesh(grid(10, 5, (uu, vv) => {
+      const s = s1;
+      const a = lip(s, 1), b = lip(s, -1);
+      const { y, top, bot } = mid(s);
+      const p = a.clone().lerp(b, uu);
+      p.z *= 0.93;
+      const up = 0.55 * (top - y) * Math.sin(Math.PI * uu);
+      const dn = -0.5 * (y + bot) * Math.sin(Math.PI * uu);
+      p.addScaledVector(model.frame(s).N, lerp(up, dn, vv) * L);
+      const w = lerp(model.jawWeight(s, 0), model.jawWeight(s, 0.5), Math.sin(Math.PI * uu)) * vv;
+      return { p, jaw: w };
+    }), interiorMat);
+
+    // teeth
+    if (m.teeth !== 'none' && m.tn > 0) {
+      const batch = new Batch();
+      const cone = new THREE.ConeGeometry(0.28, 1, 6, 1);
+      cone.translate(0, 0.5, 0);
+      const span = (rc.s - mt.s) * 0.86;
+      const tr = rng(seed + 77);
+      for (const side of [1, -1] as const)
+        for (const upper of [true, false]) {
+          const n = m.tn;
+          for (let i = 0; i < n; i++) {
+            const t = (i + 0.5) / n;
+            const s = mt.s + 0.004 + span * t;
+            const pm = model.seamPhi(s);
+            const lp = model.surface(s, side === 1 ? pm : 2 * Math.PI - pm);
+            const ctr = model.local(s, model.mouthY(s), 0);
+            lp.lerp(ctr, 0.07 + (m.teeth === 'fang' ? 0.0 : 0.05));
+            const f = model.frame(s);
+            const dir = f.N.clone().multiplyScalar(upper ? -1 : 1).addScaledVector(f.T, 0.25).add(new THREE.Vector3(0, 0, -side * 0.12)).normalize();
+            let h = m.ts * L;
+            let rad = 1, flat = 1;
+            switch (m.teeth) {
+              case 'fang': h *= (i % 3 === 0 ? 1.6 : 0.6) * (1.25 - t * 0.6) * (0.85 + tr() * 0.3); rad = 0.55; break;
+              case 'tri': rad = 1.5; flat = 0.35; break;
+              case 'shark': rad = 1.5; flat = 0.3; h *= 1.1 - 0.4 * t; break;
+              case 'needle': rad = 0.45; h *= 0.8 + tr() * 0.4; break;
+              case 'fine': h *= 0.6; break;
+              case 'beak': rad = 2.2; flat = 0.6; h *= 0.7; break;
+            }
+            if (m.teeth === 'shark' || m.teeth === 'tri') dir.addScaledVector(f.T, -0.2).normalize();
+            const M = orient(lp, dir, h * rad, h, h * rad * flat);
+            batch.add(cone, M, upper ? 0 : model.jawWeight(s, 0));
+          }
+        }
+      const toothMat = patchMaterial(new THREE.MeshPhysicalMaterial({ color: m.teeth === 'beak' ? '#e8e0cc' : '#f4efe2', roughness: 0.25, clearcoat: 0.6 }), u);
+      addMesh(batch.build(), toothMat, 2);
+    }
+  }
+
+  // ── EYES ──────────────────────────────────────────────────────────────────
+  if (sp.eye.d > 0) {
+    const e = sp.eye;
+    const r = (e.d / 2) * L;
+    const sides: { side: 1 | -1; s: number; y: number }[] = [];
+    if (sp.plan === 'flatR' || sp.plan === 'flatL') {
+      const sd = sp.plan === 'flatR' ? 1 : -1;
+      sides.push({ side: sd, s: e.s, y: e.y }, { side: sd, s: e.s + e.d * 0.9, y: e.y - 0.38 });
+    } else sides.push({ side: 1, s: e.s, y: e.y }, { side: -1, s: e.s, y: e.y });
+    const irisB = new Batch(), pupilB = new Batch(), corneaB = new Batch(), ringB = new Batch();
+    const sph = new THREE.SphereGeometry(1, 32, 20);
+    const tor = new THREE.TorusGeometry(1, 0.13, 8, 32);
+    for (const { side, s, y } of sides) {
+      const at = model.attach(s, y, side);
+      const q = new THREE.Quaternion().setFromUnitVectors(new THREE.Vector3(0, 0, 1), at.n);
+      const ctr = at.p.clone().addScaledVector(at.n, -r * 0.42);
+      const M = (off: number, sx: number, sy: number, sz: number) =>
+        new THREE.Matrix4().compose(ctr.clone().addScaledVector(at.n, off), q, new THREE.Vector3(sx, sy, sz));
+      irisB.add(sph, M(0, r, r, r * 0.92));
+      pupilB.add(sph, M(r * 0.62, r * 0.5, r * 0.5, r * 0.28));
+      corneaB.add(sph, M(r * 0.05, r * 1.03, r * 1.03, r * 1.0));
+      ringB.add(tor, M(r * 0.5, r * 0.92, r * 0.92, r * 0.6));
+    }
+    addMesh(irisB.build(), patchMaterial(new THREE.MeshPhysicalMaterial({ color: e.iris, roughness: 0.35, metalness: 0.3 }), u), 2);
+    addMesh(pupilB.build(), patchMaterial(new THREE.MeshPhysicalMaterial({ color: '#030305', roughness: 0.1 }), u), 2);
+    addMesh(ringB.build(), patchMaterial(new THREE.MeshPhysicalMaterial({ color: e.ring ?? sp.color.side, roughness: 0.5 }), u), 2);
+    addMesh(corneaB.build(), patchMaterial(new THREE.MeshPhysicalMaterial({ color: '#ffffff', roughness: 0.02, transparent: true, opacity: 0.18, clearcoat: 1 }), u), 3);
+  }
+
+  // ── FINS ──────────────────────────────────────────────────────────────────
+  const fs = sp.fins;
+  const finMat = (o: { color?: string; tip?: string; alpha?: number; rays?: number; incise?: number; edge?: string; spots?: number }) =>
+    patchMaterial(
+      new THREE.MeshPhysicalMaterial({ color: '#ffffff', roughness: 0.45, side: THREE.DoubleSide, transparent: true, depthWrite: false, clearcoat: 0.3 }),
+      u,
+      {
+        rays: o.rays ?? 14,
+        incise: o.incise ?? 0,
+        membrane: o.alpha ?? fs.alpha,
+        base: col(o.color ?? fs.color),
+        tip: col(o.tip ?? o.color ?? fs.tip ?? fs.color),
+        edge: col(o.edge ?? '#000'),
+        edgeW: o.edge ? 0.12 : 0,
+        spots: o.spots ?? 0,
+        spotCol: col('#111'),
+      },
+    );
+  const finSpots = sp.color.layers?.some((l) => l.k === 'spots' && (l.h1 ?? 1) > 0.3 && l.n > 40) ? 3 : 0;
+
+  const median = (f: MedianFin, side: 1 | -1) => {
+    const sw = (f.sweep ?? (f.shape === 'shark' || f.shape === 'falcate' ? 38 : f.shape === 'spiny' ? 18 : 12)) * DEG;
+    const nu = Math.max(16, Math.round((f.s1 - f.s0) * 140));
+    const g = grid(nu, 10, (uu, vv) => {
+      const s = lerp(f.s0, f.s1, uu);
+      const y = side > 0 ? model.top(s) * 0.93 : -model.bot(s) * 0.93;
+      const B = model.local(s, y, 0);
+      const fr = model.frame(s);
+      const a = sw * (1 + 0.25 * uu);
+      const dir = fr.N.clone().multiplyScalar(side * Math.cos(a)).addScaledVector(fr.T, Math.sin(a));
+      const H = f.h * shapeH(f.shape, uu) * L;
+      const p = B.addScaledVector(dir, (vv * 1.04 - 0.04) * H);
+      return { p, flap: vv, side: 0 };
+    });
+    addMesh(g, finMat({ ...f, rays: f.rays ?? Math.round(nu / 2.2), spots: f.spots ?? finSpots }), 4);
+  };
+  for (const f of fs.dorsal ?? []) median(f, 1);
+  for (const f of fs.anal ?? []) median(f, -1);
+  if (fs.finlets) {
+    const fl = fs.finlets;
+    for (let i = 0; i < fl.n; i++) {
+      const s = lerp(fl.s0, fl.s1, i / Math.max(1, fl.n - 1));
+      const w = (fl.s1 - fl.s0) / fl.n * 0.8;
+      for (const sd of [1, -1] as const) median({ s0: s, s1: s + w, h: fl.h, shape: 'tri', sweep: 40, rays: 3, color: fl.color, alpha: 1 }, sd);
+    }
+  }
+
+  // caudal
+  buildCaudal(fs.caudal);
+  function buildCaudal(cs: CaudalSpec) {
+    if (cs.type === 'none' && cs.span <= 0) return;
+    const len = cs.len ?? cs.span * 0.6;
+    const up = cs.up ?? (cs.type === 'hetero' ? 0.68 : 0.5);
+    const D: Record<string, { fork: number; p: number; lu: number; ld: number; tuft?: number }> = {
+      forked: { fork: 0.38, p: 1.15, lu: 1, ld: 1 },
+      lunate: { fork: 0.14, p: 0.75, lu: 1, ld: 1 },
+      emarginate: { fork: 0.82, p: 1.6, lu: 1, ld: 1 },
+      truncate: { fork: 0.96, p: 2, lu: 1, ld: 1 },
+      rounded: { fork: 1, p: 2, lu: 0.5, ld: 0.5 },
+      pointed: { fork: 1, p: 1, lu: 0.08, ld: 0.08 },
+      hetero: { fork: 0.32, p: 1.1, lu: 1, ld: 0.5 },
+      diphy: { fork: 0.8, p: 2, lu: 0.45, ld: 0.45, tuft: 0.45 },
+      halfmoon: { fork: 1, p: 3, lu: 0.85, ld: 0.85 },
+      lyre: { fork: 0.3, p: 2.6, lu: 1, ld: 1 },
+      none: { fork: 1, p: 1, lu: 0.1, ld: 0.1 },
+    };
+    const d = D[cs.type];
+    const lu = cs.lenUp ?? d.lu * len, ld = cs.lenDn ?? d.ld * len;
+    const lc = (cs.fork ?? d.fork) * len;
+    const pedTop = model.top(1), pedBot = model.bot(1);
+    const g = grid(40, 12, (uu, vv) => {
+      const yb = lerp(pedTop, -pedBot, uu) * 1.02;
+      const sb = 0.975;
+      const yE = lerp(cs.span * up, -cs.span * (1 - up), uu) + sp.body.pedY;
+      let xE: number;
+      if (uu < up) { const t = 1 - uu / up; xE = lc + (lu - lc) * Math.pow(t, d.p); }
+      else { const t = (uu - up) / (1 - up); xE = lc + (ld - lc) * Math.pow(t, d.p); }
+      if (d.tuft) xE += d.tuft * len * Math.exp(-Math.pow((uu - up) / 0.08, 2));
+      const B = model.local(sb, yb, 0);
+      const E = model.local(1 + xE, yE, 0);
+      const vv2 = vv * vv * 0.25 + vv * 0.75;
+      const p = B.lerp(E, vv2);
+      return { p, flap: vv * 0.4, side: 0 };
+    });
+    addMesh(g, finMat({ color: cs.color, tip: cs.tip, alpha: cs.alpha, rays: cs.rays ?? 20, edge: cs.edge, spots: finSpots }), 4);
+  }
+
+  // paired fins
+  const paired = (f: PairedFin) => {
+    for (const side of [1, -1] as const) {
+      const at = model.attach(f.s, f.y, side);
+      const fr = model.frame(f.s);
+      const Z = new THREE.Vector3(0, 0, side);
+      const el = f.elev * DEG, sp_ = f.splay * DEG;
+      const dir = fr.T.clone().multiplyScalar(Math.cos(el) * Math.cos(sp_)).addScaledVector(fr.N, Math.sin(el) * Math.cos(sp_)).addScaledVector(Z, Math.sin(sp_)).normalize();
+      const nf = Z.clone().multiplyScalar(Math.cos(sp_)).addScaledVector(fr.N, Math.sin(sp_) * side).normalize();
+      const b = new THREE.Vector3().crossVectors(nf, dir).normalize();
+      const spread = (f.shape === 'fan' ? 55 : f.shape === 'veil' ? 30 : 14) * DEG;
+      const base = at.p.clone().addScaledVector(at.n, -0.004 * L);
+      const g = grid(18, 10, (uu, vv) => {
+        const a = (uu - 0.5) * spread;
+        const H = f.len * shapeH(f.shape, uu) * L;
+        const ray = dir.clone().multiplyScalar(Math.cos(a)).addScaledVector(b, Math.sin(a));
+        const p = base.clone().addScaledVector(b, (uu - 0.5) * f.base * L).addScaledVector(ray, vv * H);
+        p.addScaledVector(nf, Math.sin(vv * Math.PI * 0.5) * H * 0.06 * side);
+        return { p, flap: vv, side };
+      });
+      addMesh(g, finMat({ ...f, rays: f.rays ?? 12 }), 4);
+    }
+  };
+  if (fs.pec) paired(fs.pec);
+  if (fs.pel) paired(fs.pel);
+
+  // ── ROSTRUM (bills, swords, saws, paddles, tubular snouts) ────────────────
+  if (sp.rostrum) {
+    const ro = sp.rostrum;
+    const fr0 = model.frame(0.0);
+    const fwd = fr0.T.clone().negate();
+    const yb = ro.kind === 'tube' ? 0 : model.top(0.03) * 0.25;
+    const start = model.local(0.04, yb, 0);
+    const flat = ro.flat ?? 0;
+    const g = grid(16, 40, (uu, vv) => {
+      const t = vv * 1.1 - 0.1;
+      let w = ro.r, h = ro.r;
+      switch (ro.kind) {
+        case 'bill': w = h = ro.r * Math.pow(1 - clamp(t), 0.75) + 0.002; break;
+        case 'sword': w = ro.r * Math.pow(1 - clamp(t), 0.55) + 0.002; h = w * (1 - flat); break;
+        case 'saw': w = ro.r * (1 - 0.35 * clamp(t)) + 0.002; h = w * (1 - flat); break;
+        case 'paddle': w = ro.r * (0.55 + 1.5 * Math.pow(Math.sin(Math.PI * clamp(t) * 0.92), 0.7)); h = ro.r * 0.4 * (1 - 0.6 * clamp(t)); break;
+        case 'tube': w = h = ro.r * (1 - 0.15 * clamp(t)); break;
+      }
+      const a = uu * Math.PI * 2;
+      const tip = t > 0.985 ? smooth(1.1, 0.985, t) : 1;
+      const p = start.clone().addScaledVector(fwd, t * ro.len * L)
+        .addScaledVector(fr0.N, Math.cos(a) * h * L * tip)
+        .add(new THREE.Vector3(0, 0, Math.sin(a) * w * L * tip));
+      return { p };
+    }, true);
+    const rm = patchMaterial(new THREE.MeshPhysicalMaterial({ color: ro.color ?? sp.color.top, roughness: 0.45, clearcoat: 0.4, bumpMap: bump, bumpScale: 0.3 }), u);
+    addMesh(g, rm, 1);
+    if (ro.kind === 'saw') {
+      const batch = new Batch();
+      const cone = new THREE.ConeGeometry(0.3, 1, 5); cone.translate(0, 0.5, 0);
+      const n = 24;
+      for (let i = 0; i < n; i++) {
+        const t = 0.05 + 0.92 * (i / (n - 1));
+        const w = ro.r * (1 - 0.35 * t);
+        for (const sd of [1, -1]) {
+          const p = start.clone().addScaledVector(fwd, t * ro.len * L).add(new THREE.Vector3(0, 0, sd * w * L * 0.95));
+          batch.add(cone, orient(p, new THREE.Vector3(0.25, 0, sd), 0.012 * L * 0.6, 0.03 * L, 0.012 * L * 0.6));
+        }
+      }
+      addMesh(batch.build(), patchMaterial(new THREE.MeshPhysicalMaterial({ color: '#efe8d8', roughness: 0.3 }), u), 2);
+    }
+    if (ro.kind === 'tube') {
+      const tipP = start.clone().addScaledVector(fwd, ro.len * L);
+      const disc = new THREE.CircleGeometry(ro.r * L * 0.65, 20);
+      const batch = new Batch();
+      batch.add(disc, new THREE.Matrix4().compose(tipP.addScaledVector(fwd, 0.002), new THREE.Quaternion().setFromUnitVectors(new THREE.Vector3(0, 0, 1), fwd), new THREE.Vector3(1, 0.7, 1)));
+      addMesh(batch.build(), patchMaterial(new THREE.MeshStandardMaterial({ color: '#1a0508', side: THREE.DoubleSide }), u), 2);
+    }
+  }
+
+  // ── lamprey oral disc ─────────────────────────────────────────────────────
+  if (m.kind === 'disc') {
+    const fr0 = model.frame(0.02);
+    const fwd = fr0.T.clone().negate();
+    const dn = fr0.N.clone().negate();
+    const face = fwd.clone().multiplyScalar(0.55).addScaledVector(dn, 0.85).normalize();
+    const ctr = model.local(0.035, -model.bot(0.035) * 0.55, 0).addScaledVector(face, 0.01 * L);
+    const r = model.bot(0.04) * 1.15 * L;
+    const q = new THREE.Quaternion().setFromUnitVectors(new THREE.Vector3(0, 0, 1), face);
+    const b1 = new Batch(), b2 = new Batch(), b3 = new Batch();
+    b1.add(new THREE.TorusGeometry(r, r * 0.22, 10, 40), new THREE.Matrix4().compose(ctr, q, new THREE.Vector3(1, 1, 1)));
+    b2.add(new THREE.CircleGeometry(r, 40), new THREE.Matrix4().compose(ctr.clone().addScaledVector(face, -r * 0.1), q, new THREE.Vector3(1, 1, 1)));
+    const cone = new THREE.ConeGeometry(0.3, 1, 5); cone.translate(0, 0.5, 0); cone.rotateX(Math.PI / 2);
+    for (let ringI = 0; ringI < 3; ringI++)
+      for (let i = 0; i < 14 + ringI * 6; i++) {
+        const a = (i / (14 + ringI * 6)) * Math.PI * 2;
+        const rr = r * (0.25 + ringI * 0.25);
+        const p = new THREE.Vector3(Math.cos(a) * rr, Math.sin(a) * rr, 0).applyQuaternion(q).add(ctr);
+        b3.add(cone, new THREE.Matrix4().compose(p, q, new THREE.Vector3(r * 0.12, r * 0.12, r * 0.2)));
+      }
+    addMesh(b1.build(), patchMaterial(new THREE.MeshPhysicalMaterial({ color: sp.color.belly, roughness: 0.5 }), u), 2);
+    addMesh(b2.build(), patchMaterial(new THREE.MeshStandardMaterial({ color: '#6a2c2c', side: THREE.DoubleSide }), u), 2);
+    addMesh(b3.build(), patchMaterial(new THREE.MeshPhysicalMaterial({ color: '#f0d890', roughness: 0.3 }), u), 3);
+  }
+
+  // ── BARBELS, LURES, CIRRI ─────────────────────────────────────────────────
+  const tube = (pts: THREE.Vector3[], r0: number, r1: number, jawW: number) => {
+    const crv = new THREE.CatmullRomCurve3(pts);
+    const nS = 24, nR = 7;
+    const frames = crv.computeFrenetFrames(nS, false);
+    return grid(nR, nS, (uu, vv) => {
+      const i = Math.round(vv * nS);
+      const p = crv.getPointAt(vv);
+      const a = uu * Math.PI * 2;
+      const r = lerp(r0, r1, vv);
+      p.addScaledVector(frames.normals[i], Math.cos(a) * r).addScaledVector(frames.binormals[i], Math.sin(a) * r);
+      return { p, jaw: jawW, flap: vv * 0.6, side: 0 };
+    });
+  };
+  const barbelMat = patchMaterial(new THREE.MeshPhysicalMaterial({ color: sp.color.side, roughness: 0.5, clearcoat: 0.3 }), u);
+  const bulbBatch = new Batch();
+  let bulbColor = '#9ff';
+  const barbelList = [...(sp.barbels ?? [])];
+  if (sp.cirri) barbelList.push({ s: sp.eye.s, y: sp.eye.y + 0.25, len: 0.05, dir: [0.1, 1, 0.15], droop: -0.2, r: 0.004, pairs: true });

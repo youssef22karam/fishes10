@@ -1,0 +1,110 @@
+  for (const bb of barbelList) {
+    for (const side of (bb.pairs === false ? [1] : [1, -1]) as (1 | -1)[]) {
+      const at = model.attach(bb.s, bb.y, side);
+      const fr = model.frame(bb.s);
+      const d = fr.T.clone().multiplyScalar(-bb.dir[0]).addScaledVector(fr.N, bb.dir[1]).add(new THREE.Vector3(0, 0, side * bb.dir[2])).normalize();
+      const pts: THREE.Vector3[] = [];
+      for (let k = 0; k <= 5; k++) {
+        const t = k / 5;
+        pts.push(at.p.clone().addScaledVector(d, t * bb.len * L).addScaledVector(fr.N, -bb.droop * t * t * bb.len * L).addScaledVector(fr.T, 0.15 * t * t * bb.len * L));
+      }
+      if (bb.pairs === false) pts.forEach((p) => (p.z = 0));
+      const yAbs = model.normY(bb.s, bb.y);
+      const jw = bb.s < rc.s + 0.01 && yAbs < model.mouthY(bb.s) ? model.jawWeight(bb.s, 0.4) : 0;
+      addMesh(tube(pts, bb.r * L, bb.r * L * 0.25, jw), barbelMat, 2);
+      if (bb.bulb) {
+        bulbColor = bb.bulb;
+        bulbBatch.add(new THREE.SphereGeometry(1, 16, 12), new THREE.Matrix4().compose(pts[5], new THREE.Quaternion(), new THREE.Vector3(1, 1, 1).multiplyScalar(bb.r * L * 2.6)), jw);
+      }
+      if (bb.pairs === false) break;
+    }
+  }
+  if (!bulbBatch.empty) addMesh(bulbBatch.build(), patchMaterial(new THREE.MeshStandardMaterial({ color: bulbColor, emissive: bulbColor, emissiveIntensity: 1.6 }), u), 3);
+
+  // ── SPIKES / HORNS / SCUTES / SPINES ──────────────────────────────────────
+  const spikeB = new Batch();
+  const spikeCone = new THREE.ConeGeometry(0.35, 1, 6); spikeCone.translate(0, 0.5, 0);
+  for (const k of sp.spikes ?? []) {
+    for (const side of (k.mirror === false ? [1] : [1, -1]) as (1 | -1)[]) {
+      const at = model.attach(k.s, k.y, side);
+      const fr = model.frame(k.s);
+      const d = (k.dir[0] || k.dir[1] || k.dir[2])
+        ? fr.T.clone().multiplyScalar(-k.dir[0]).addScaledVector(fr.N, k.dir[1]).add(new THREE.Vector3(0, 0, side * k.dir[2])).normalize()
+        : at.n;
+      const h = k.len * L, r = (k.r ?? 0.3) * h;
+      spikeB.add(spikeCone, orient(at.p.addScaledVector(at.n, -h * 0.1), d, r, h, r));
+      if (k.mirror === false) break;
+    }
+  }
+  if (sp.spines) {
+    for (let i = 0; i < sp.spines.n; i++) {
+      const s = 0.08 + R() * 0.8;
+      const yn = R() * 2 - 1;
+      const side = R() > 0.5 ? 1 : -1;
+      const at = model.attach(s, yn * 0.95, side);
+      const fr = model.frame(s);
+      const d = at.n.clone().multiplyScalar(0.55).addScaledVector(fr.T, 0.8).normalize();
+      const h = sp.spines.len * L * (0.6 + R() * 0.6);
+      spikeB.add(spikeCone, orient(at.p, d, h * 0.16, h, h * 0.16));
+    }
+  }
+  if (!spikeB.empty) addMesh(spikeB.build(), patchMaterial(new THREE.MeshPhysicalMaterial({ color: sp.spines?.c ?? sp.color.side, roughness: 0.4, clearcoat: 0.3 }), u), 2);
+
+  // ── FRONDS (seadragons) ───────────────────────────────────────────────────
+  if (sp.fronds) {
+    for (const [s, y, len] of sp.fronds.at) {
+      const sides: (1 | -1)[] = Math.abs(y) > 0.9 ? [1] : [1, -1];
+      for (const side of sides) {
+        const at = model.attach(s, y, side);
+        const out = at.n.clone();
+        const nf = new THREE.Vector3().crossVectors(out, new THREE.Vector3(1, 0, 0)).normalize();
+        const b = new THREE.Vector3().crossVectors(nf, out).normalize();
+        const lobes = 3;
+        for (let l = 0; l < lobes; l++) {
+          const a = (l - 1) * 0.55;
+          const d = out.clone().multiplyScalar(Math.cos(a)).addScaledVector(b, Math.sin(a));
+          const g = grid(10, 8, (uu, vv) => {
+            const H = len * L * (l === 1 ? 1 : 0.75);
+            const w = 0.022 * L * Math.sin(Math.PI * vv) * (0.6 + 0.4 * Math.sin(vv * 9));
+            const p = at.p.clone().addScaledVector(d, vv * H).addScaledVector(b, (uu - 0.5) * w * 2);
+            return { p, flap: vv * 0.8, side: 0 };
+          });
+          addMesh(g, finMat({ color: sp.fronds.c, tip: sp.fronds.c, alpha: 0.9, rays: 3 }), 4);
+        }
+      }
+    }
+  }
+
+  // ── animation constants & plan orientation ────────────────────────────────
+  const swim = SWIM[sp.swim.mode] ?? SWIM.carangiform;
+  u.uHinge.value.copy(model.hingeXY());
+  u.uL.value = L;
+  u.uX0.value = model.local(0, 0, 0).x;
+  u.uAmp.value = sp.body.bend ? 0 : swim.amp;
+  u.uWave.value = swim.wave;
+  u.uFreq.value = swim.freq;
+  u.uA0.value = swim.a0;
+  u.uPow.value = swim.pow;
+  u.uFlap.value = swim.flap;
+  u.uFinWave.value = swim.finWave;
+  let wing = 0;
+  if (sp.plan === 'ray') {
+    wing = sp.id.includes('manta') ? 0.22 : 0.1;
+    u.uSpan.value = (sp.body.disc?.span ?? 0.5) * L;
+    u.uWingF.value = sp.id.includes('manta') ? 1.4 : 2.2;
+  }
+  u.uWing.value = wing;
+  if (sp.plan === 'flatR') group.rotation.x = -Math.PI / 2;
+  if (sp.plan === 'flatL') group.rotation.x = Math.PI / 2;
+
+  const box = new THREE.Box3().setFromObject(group);
+  const radius = box.getSize(new THREE.Vector3()).length() / 2;
+  const ctr = box.getCenter(new THREE.Vector3());
+  group.children.forEach((ch) => ch.position.sub(ctr.clone().applyQuaternion(group.quaternion.clone().invert())));
+
+  return {
+    group, model, uniforms: u, swim, wing, radius,
+    dispose: () => disposables.forEach((d) => d.dispose()),
+  };
+}
+
